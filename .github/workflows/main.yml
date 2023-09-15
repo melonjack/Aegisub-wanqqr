@@ -1,0 +1,192 @@
+name: GitHubActions CI tests
+
+on:
+  push:
+    branches: [master, dev, ci]
+  pull_request:
+
+jobs:
+  build-nix:
+    strategy:
+      matrix:
+        os: [ubuntu-20.04, macos-10.15]
+        build_suite: [autoconf, cmake]
+        with_coveralls: [no]
+        # Run one build with gcov and coveralls
+        # (Does currently not work, but neither did it in travis)
+        #include:
+        #  - os: ubuntu-20.04
+        #    build_suite: autoconf
+        #    with_coveralls: yes
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: checkout code
+        uses: actions/checkout@v2
+
+      - name: install deps
+        run: |
+          if (echo "${{ matrix.os }}" | grep -qE '^macos-') ; then
+            #brew update
+            # freetype, gettext, icuc4 and autoconf are preinstalled
+            # and `brew install` fails if a non-uptodate version is already installed
+            #brew upgrade autoconf freetype gettext icu4c
+            brew analytics off  # https://github.com/Homebrew/brew/issues/142 https://github.com/Homebrew/brew/pull/6745
+            brew install automake boost ffmpeg ffms2 fftw fribidi libass \
+                         lua luarocks m4 wxwidgets hunspell uchardet
+            # Use bundled googletest
+            git submodule --quiet init
+            git submodule --quiet update vendor/googletest
+          else
+            #sudo apt-get update && sudo apt-get upgrade -y
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends ${{ matrix.build_suite }} \
+              autopoint build-essential g++ gcc gettext libasound2-dev \
+              libass-dev  libffms2-dev libfftw3-dev libfontconfig1-dev   \
+              libfribidi-dev libgtest-dev libhunspell-dev libicu-dev libopenal-dev       \
+              libpulse-dev libuchardet-dev libwxgtk3.0-gtk3-dev luarocks portaudio19-dev \
+              python3-pip python3-setuptools \
+              pkg-config libgl1-mesa-dev libgl-dev libfreetype6-dev libfontconfig-dev \
+              intltool libboost-all-dev googletest
+            if [ "x${{ matrix.with_coveralls }}" = "xyes" ] ; then
+              sudo pip3 install -U cpp-coveralls
+            fi
+            if [ "x${{ matrix.build_suite }}" = "xautoconf" ] ; then
+              # Use system provided googletest via source
+              # (CMake will precompile it and use the binaries)
+              rm -fr vendor/googletest
+              cp -R /usr/src/googletest/googletest vendor/
+            fi
+          fi
+
+          sudo luarocks install busted     > /dev/null  ||  sudo luarocks install --server https://raw.githubusercontent.com/rocks-moonscript-org/moonrocks-mirror/master/ busted     > /dev/null
+          sudo luarocks install moonscript > /dev/null  ||  sudo luarocks install --server https://raw.githubusercontent.com/rocks-moonscript-org/moonrocks-mirror/master/ moonscript > /dev/null
+          sudo luarocks install uuid       > /dev/null  ||  sudo luarocks install --server https://raw.githubusercontent.com/rocks-moonscript-org/moonrocks-mirror/master/ uuid       > /dev/null
+
+      - name: set up MacOS env
+        if: ${{ startsWith( matrix.os, 'macos-' ) }}
+        run: |
+          # Changes are only available in the following steps, not the current one
+          echo 'CPPFLAGS=-I/usr/local/opt/gettext/include -I/usr/local/opt/icu4c/include' >> $GITHUB_ENV
+          echo 'LDFLAGS=-L/usr/local/opt/gettext/lib -L/usr/local/opt/icu4c/lib' >> $GITHUB_ENV
+          echo 'PKG_CONFIG_PATH=/usr/local/opt/icu4c/lib/pkgconfig' >> $GITHUB_ENV
+          echo 'ACLOCAL_PATH=/usr/local/opt/gettext/share/aclocal'  >> $GITHUB_ENV
+          # Prepend to $PATH
+          echo "/usr/local/opt/icu4c/bin"   >> $GITHUB_PATH
+          echo "/usr/local/opt/icu4c/sbin"  >> $GITHUB_PATH
+          echo "/usr/local/opt/gettext/bin" >> $GITHUB_PATH
+
+      - name: set up coverage env
+        if: ${{ matrix.with_coveralls == 'yes' }}
+        run: |
+          echo "CPPFLAGS=--coverage $CPPFLAGS" >> $GITHUB_ENV
+          echo "LIBS=-lgcov $LIBS" >> $GITHUB_ENV
+
+      - name: configure
+        run: |
+          if [ "x${{ matrix.build_suite }}" = "xautoconf" ] ; then
+            ./autogen.sh
+            ./configure --enable-debug || (cat config.log; exit 1)
+          else
+            mkdir build-dir
+            cd build-dir
+            if (echo "${{ matrix.os }}" | grep -qE '^macos-') ; then
+              CMAKE_PLATFORM_OPTIONS='-DICU_INCLUDE_DIR=/usr/local/opt/icu4c/include -DICU_UC_LIBRARY_RELEASE=/usr/local/opt/icu4c/lib/libicuuc.dylib -DICU_DT_LIBRARY_RELEASE=/usr/local/opt/icu4c/lib/libicudata.dylib -DICU_IN_LIBRARY_RELEASE=/usr/local/opt/icu4c/lib/libicui18n.dylib'
+            fi
+            cmake -DCMAKE_CXX_FLAGS='-Wall -Wextra -Wno-unused-parameter -pedantic' -DCMAKE_C_FLAGS='-Wall -Wextra -Wno-unused-parameter' -DWITH_STARTUPLOG=ON -DWITH_TEST=ON $CMAKE_PLATFORM_OPTIONS .. || (cat CMakeFiles/CMakeOutput.log CMakeFiles/CMakeError.log; exit 1)
+          fi
+
+      - name: build
+        run: |
+          [ "x${{ matrix.build_suite }}" = "xautoconf" ] || cd build-dir
+          make -j 2
+
+      - name: run tests
+        run: |
+          [ "x${{ matrix.build_suite }}" = "xautoconf" ] || cd build-dir
+          make test
+
+      - name: coveralls
+        if: ${{ matrix.with_coveralls == 'yes' }}
+        run: |
+          coveralls --exclude vendor --exclude src --exclude build \
+                    --exclude tools --exclude libaegisub/windows \
+                    > /dev/null
+
+      - name: package
+        if: ${{ startsWith( matrix.os, 'macos-' ) && matrix.build_suite == 'autoconf' }}
+        run: |
+          make osx-dmg
+          mv *.dmg aegisub-macos-GHA.dmg
+
+      - name: upload artifact
+        if: ${{ startsWith( matrix.os, 'macos-' ) && matrix.build_suite == 'autoconf' }}
+        uses: actions/upload-artifact@v2
+        with:
+          name: aegisub-macos-GHA
+          path: aegisub-macos-GHA.dmg
+
+  build-win:
+    runs-on: windows-latest
+    steps:
+    - name: checkout code
+      uses: actions/checkout@v2
+
+    - name: cache vcpkg packages
+      uses: pat-s/always-upload-cache@v2
+      with:
+        path: C:\Users\runneradmin\AppData\Local\vcpkg\archives
+        key: vcpkg-archives-${{ github.run_id }}
+        restore-keys: vcpkg-archives-
+
+    - name: install deps
+      run: |
+        Invoke-WebRequest -Uri https://github.com/FFMS/ffms2/releases/download/2.23/ffms2-2.23.1-msvc.7z -OutFile vendor/ffms2-2.23.1-msvc.7z
+
+        7z.exe x vendor/ffms2-2.23.1-msvc.7z -ovendor/ffms2
+
+        Set-Content -Value "" -Path "C:\vcpkg\vcpkg.disable-metrics" -Force
+        # Fix vcpkg wxwidgets fail when building without debug
+        (Get-Content "C:\vcpkg\ports\wxwidgets\vcpkg-cmake-wrapper.cmake") -replace '    _find_package', '    #_find_package' | Set-Content "C:\vcpkg\ports\wxwidgets\vcpkg-cmake-wrapper.cmake"
+        vcpkg.exe install --triplet x64-windows-release avisynthplus boost-asio boost-container boost-crc boost-filesystem boost-flyweight boost-gil boost-interprocess 'boost-locale[icu]' 'boost-regex[icu]' boost-scope-exit boost-thread fftw3 hunspell icu libass libiconv uchardet wxwidgets xaudio2redist gtest
+
+    - name: configure
+      run: |
+        bash.exe build/version.sh .
+        New-Item -Path build-dir -ItemType directory
+        Set-Location build-dir
+        cmake.exe '-DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake' '-DVCPKG_TARGET_TRIPLET=x64-windows-release' '-DFFMS2_INCLUDE_DIRS=../vendor/ffms2/ffms2-2.23.1-msvc/include' '-DFFMS2_LIBRARIES=../vendor/ffms2/ffms2-2.23.1-msvc/x64/ffms2.lib' '-DXAUDIO2_REDIST=ON' '-DCMAKE_CXX_FLAGS=/DWIN32 /D_WINDOWS /GR /EHsc /DUNICODE /D_UNICODE /MP' '-DCMAKE_C_FLAGS=/DWIN32 /D_WINDOWS /DUNICODE /D_UNICODE /MP' '-DWITH_TEST=ON' ..
+
+    - name: Add msbuild to PATH
+      uses: microsoft/setup-msbuild@v1.0.2
+
+    - name: build
+      run: |
+        Set-Location build-dir
+        MSBuild.exe Aegisub.vcxproj -p:Configuration=Release
+
+    - name: run tests
+      run: |
+        Set-Location build-dir
+        MSBuild.exe test.vcxproj -p:Configuration=Release
+
+    - name: package
+      run: |
+        Invoke-WebRequest -Uri https://ftp.wangqr.tk/aegisub/aegisub-win64-cmake-20210713-r9212.zip -OutFile vendor/aegisub9212.zip
+
+        7z.exe x vendor/aegisub9212.zip -ovendor/aegisub9212
+
+        Move-Item -Path build-dir\Release\Aegisub.exe -Destination build-dir\Aegisub.exe
+        Remove-Item -Path build-dir\Release\*.exp,build-dir\Release\*.lib,build-dir\Release\*.exe
+        Move-Item -Path build-dir\Aegisub.exe -Destination build-dir\Release\Aegisub.exe
+        New-Item -Path build-dir\Release\automation -ItemType directory
+        Copy-Item -Path automation\autoload,automation\demos,automation\include -Destination build-dir\Release\automation -Recurse
+
+        Copy-Item -Path C:\vcpkg\installed\x64-windows-release\bin\AviSynth.dll -Destination build-dir\Release
+        Copy-Item -Path vendor\ffms2\ffms2-2.23.1-msvc\x64\ffms2.dll -Destination build-dir\Release
+        Copy-Item -Path vendor\aegisub9212\csri,vendor\aegisub9212\dictionaries,vendor\aegisub9212\licenses,vendor\aegisub9212\locale,vendor\aegisub9212\AssDraw3.exe,vendor\aegisub9212\AssDraw3.chm,vendor\aegisub9212\DirectShowSource.dll -Destination build-dir\Release -Recurse
+
+    - name: upload artifact
+      uses: actions/upload-artifact@v2
+      with:
+        name: aegisub-win64-cmake-GHA
+        path: build-dir/Release
